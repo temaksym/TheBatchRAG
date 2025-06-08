@@ -1,0 +1,862 @@
+
+
+        >>> logits = outputs.logits
+        >>> logits_aggregation = outputs.logits_aggregation
+        ```"""
+
+        outputs = self.tapas(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+
+        sequence_output = outputs[0]
+        pooled_output = outputs[1]
+
+        sequence_output = self.dropout(sequence_output)
+
+        if input_ids is not None:
+            input_shape = shape_list(input_ids)
+        else:
+            input_shape = shape_list(inputs_embeds)[:-1]
+
+        # Construct indices for the table.
+        if token_type_ids is None:
+            token_type_ids = tf.fill(input_shape + [len(self.config.type_vocab_sizes)], 0)
+
+        token_types = [
+            "segment_ids",
+            "column_ids",
+            "row_ids",
+            "prev_labels",
+            "column_ranks",
+            "inv_column_ranks",
+            "numeric_relations",
+        ]
+
+        row_ids = token_type_ids[:, :, token_types.index("row_ids")]
+        column_ids = token_type_ids[:, :, token_types.index("column_ids")]
+
+        # Construct indices for the table.
+        row_index = IndexMap(
+            indices=tf.minimum(tf.cast(row_ids, tf.int32), self.config.max_num_rows - 1),
+            num_segments=self.config.max_num_rows,
+            batch_dims=1,
+        )
+        col_index = IndexMap(
+            indices=tf.minimum(tf.cast(column_ids, tf.int32), self.config.max_num_columns - 1),
+            num_segments=self.config.max_num_columns,
+            batch_dims=1,
+        )
+        cell_index = ProductIndexMap(row_index, col_index)
+
+        # Masks.
+        input_shape = shape_list(input_ids) if input_ids is not None else shape_list(inputs_embeds)[:-1]
+        if attention_mask is None:
+            attention_mask = tf.ones(input_shape)
+        # Table cells only, without question tokens and table headers.
+        if table_mask is None:
+            table_mask = tf.where(row_ids > 0, tf.ones_like(row_ids), tf.zeros_like(row_ids))
+        # <float32>[batch_size, seq_length]
+        input_mask_float = tf.cast(attention_mask, tf.float32)
+        table_mask_float = tf.cast(table_mask, tf.float32)
+
+        # Mask for cells that exist in the table (i.e. that are not padding).
+        cell_mask, _ = reduce_mean(input_mask_float, cell_index)
+
+        # Compute logits per token. These are used to select individual cells.
+        logits = self.compute_token_logits(sequence_output)
+
+        # Compute logits per column. These are used to select a column.
+        column_logits = None
+        if self.config.select_one_column:
+            column_logits = self.compute_column_logits(
+                sequence_output, cell_index, cell_mask, self.config.allow_empty_column_selection
+            )
+
+        # Aggregate logits.
+        logits_aggregation = None
+        if self.config.num_aggregation_labels > 0:
+            logits_aggregation = self.aggregation_classifier(pooled_output)
+
+        # Total loss calculation
+        total_loss = tf.zeros(shape=(1,), dtype=tf.float32)
+        calculate_loss = False
+        if labels is not None:
+            calculate_loss = True
+            is_supervised = not self.config.num_aggregation_labels > 0 or not self.config.use_answer_as_supervision
+
+            # Semi-supervised cell selection in case of no aggregation:
+            # If the answer (the denotation) appears directly in the table we might
+            # select the answer without applying any aggregation function. There are
+            # some ambiguous cases, see utils._calculate_aggregate_mask for more info.
+            # `aggregate_mask` is 1 for examples where we chose to aggregate and 0
+            #  for examples where we chose to select the answer directly.
+            # `labels` encodes the positions of the answer appearing in the table.
+            if is_supervised:
+                aggregate_mask = None
+            else:
+                if float_answer is not None:
+                    assert shape_list(labels)[0] == shape_list(float_answer)[0], (
+                        "Make sure the answers are a FloatTensor of shape (batch_size,)"
+                    )
+                    # <float32>[batch_size]
+                    aggregate_mask = _calculate_aggregate_mask(
+                        float_answer,
+                        pooled_output,
+                        self.config.cell_selection_preference,
+                        labels,
+                        self.aggregation_classifier,
+                    )
+                else:
+                    aggregate_mask = None
+                    raise ValueError("You have to specify float answers in order to calculate the aggregate mask")
+
+            # Cell selection log-likelihood
+            if self.config.average_logits_per_cell:
+                logits_per_cell, _ = reduce_mean(logits, cell_index)
+                logits = gather(logits_per_cell, cell_index)
+            dist_per_token = tfp.distributions.Bernoulli(logits=logits)
+
+            # Compute cell selection loss per example.
+            selection_loss_per_example = None
+            if not self.config.select_one_column:
+                weight = tf.where(
+                    labels == 0,
+                    tf.ones_like(labels, dtype=tf.float32),
+                    self.config.positive_label_weight * tf.ones_like(labels, dtype=tf.float32),
+                )
+                selection_loss_per_token = -dist_per_token.log_prob(labels) * weight
+                selection_loss_per_example = tf.reduce_sum(selection_loss_per_token * input_mask_float, axis=1) / (
+                    tf.reduce_sum(input_mask_float, axis=1) + EPSILON_ZERO_DIVISION
+                )
+            else:
+                selection_loss_per_example, logits = _single_column_cell_selection_loss(
+                    logits, column_logits, labels, cell_index, col_index, cell_mask
+                )
+                dist_per_token = tfp.distributions.Bernoulli(logits=logits)
+
+            # Supervised cell selection
+            if self.config.disable_per_token_loss:
+                pass
+            elif is_supervised:
+                total_loss += tf.reduce_mean(selection_loss_per_example)
+            else:
+                # For the not supervised case, do not assign loss for cell selection
+                total_loss += tf.reduce_mean(selection_loss_per_example * (1.0 - aggregate_mask))
+
+            # Semi-supervised regression loss and supervised loss for aggregations
+            if self.config.num_aggregation_labels > 0:
+                if is_supervised:
+                    # Note that `aggregate_mask` is None if the setting is supervised.
+                    if aggregation_labels is not None:
+                        assert shape_list(labels)[0] == shape_list(aggregation_labels)[0], (
+                            "Make sure the aggregation labels are a LongTensor of shape (batch_size,)"
+                        )
+                        per_example_additional_loss = _calculate_aggregation_loss(
+                            logits_aggregation,
+                            aggregate_mask,
+                            aggregation_labels,
+                            self.config.use_answer_as_supervision,
+                            self.config.num_aggregation_labels,
+                            self.config.aggregation_loss_weight,
+                        )
+                    else:
+                        raise ValueError(
+                            "You have to specify aggregation labels in order to calculate the aggregation loss"
+                        )
+                else:
+                    aggregation_labels = tf.zeros(shape_list(labels)[0], dtype=tf.int32)
+                    per_example_additional_loss = _calculate_aggregation_loss(
+                        logits_aggregation,
+                        aggregate_mask,
+                        aggregation_labels,
+                        self.config.use_answer_as_supervision,
+                        self.config.num_aggregation_labels,
+                        self.config.aggregation_loss_weight,
+                    )
+
+                if self.config.use_answer_as_supervision:
+                    if numeric_values is not None and numeric_values_scale is not None:
+                        assert shape_list(numeric_values) == shape_list(numeric_values_scale)
+                        # Add regression loss for numeric answers which require aggregation.
+                        answer_loss, large_answer_loss_mask = _calculate_regression_loss(
+                            float_answer,
+                            aggregate_mask,
+                            dist_per_token,
+                            numeric_values,
+                            numeric_values_scale,
+                            table_mask_float,
+                            logits_aggregation,
+                            self.config,
+                        )
+                        per_example_additional_loss += answer_loss
+                        # Zero loss for examples with answer_loss > cutoff.
+                        per_example_additional_loss *= large_answer_loss_mask
+                    else:
+                        raise ValueError(
+                            "You have to specify numeric values and numeric values scale in order to calculate the"
+                            " regression loss"
+                        )
+                total_loss += tf.reduce_mean(per_example_additional_loss)
+
+        else:
+            # if no label ids are provided, set them to zeros in order to properly compute logits
+            labels = tf.zeros_like(logits)
+            _, logits = _single_column_cell_selection_loss(
+                logits, column_logits, labels, cell_index, col_index, cell_mask
+            )
+        if not return_dict:
+            output = (logits, logits_aggregation) + outputs[2:]
+            return ((total_loss,) + output) if calculate_loss else output
+
+        return TFTableQuestionAnsweringOutput(
+            loss=total_loss if calculate_loss else None,
+            logits=logits,
+            logits_aggregation=logits_aggregation,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "tapas", None) is not None:
+            with tf.name_scope(self.tapas.name):
+                self.tapas.build(None)
+        if getattr(self, "compute_token_logits", None) is not None:
+            with tf.name_scope(self.compute_token_logits.name):
+                self.compute_token_logits.build(None)
+        if getattr(self, "compute_column_logits", None) is not None:
+            with tf.name_scope(self.compute_column_logits.name):
+                self.compute_column_logits.build(None)
+        if getattr(self, "aggregation_classifier", None) is not None:
+            with tf.name_scope(self.aggregation_classifier.name):
+                self.aggregation_classifier.build([None, None, self.config.hidden_size])
+
+
+@add_start_docstrings(
+    """
+    Tapas Model with a sequence classification head on top (a linear layer on top of the pooled output), e.g. for table
+    entailment tasks, such as TabFact (Chen et al., 2020).
+    """,
+    TAPAS_START_DOCSTRING,
+)
+class TFTapasForSequenceClassification(TFTapasPreTrainedModel, TFSequenceClassificationLoss):
+    def __init__(self, config: TapasConfig, *inputs, **kwargs):
+        super().__init__(config, *inputs, **kwargs)
+        self.num_labels = config.num_labels
+
+        self.tapas = TFTapasMainLayer(config, name="tapas")
+        self.dropout = keras.layers.Dropout(config.hidden_dropout_prob, name="dropout")
+        self.classifier = keras.layers.Dense(
+            config.num_labels, kernel_initializer=get_initializer(config.initializer_range), name="classifier"
+        )
+        self.config = config
+
+    @unpack_inputs
+    @add_start_docstrings_to_model_forward(TAPAS_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
+    @replace_return_docstrings(output_type=TFSequenceClassifierOutput, config_class=_CONFIG_FOR_DOC)
+    def call(
+        self,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
+        training: Optional[bool] = False,
+    ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy). Note: this is called
+            "classification_class_index" in the original implementation.
+
+        Returns:
+
+        Examples:
+
+        ```python
+        >>> from transformers import AutoTokenizer, TapasForSequenceClassification
+        >>> import tensorflow as tf
+        >>> import pandas as pd
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("google/tapas-base-finetuned-tabfact")
+        >>> model = TapasForSequenceClassification.from_pretrained("google/tapas-base-finetuned-tabfact")
+
+        >>> data = {
+        ...     "Actors": ["Brad Pitt", "Leonardo Di Caprio", "George Clooney"],
+        ...     "Age": ["56", "45", "59"],
+        ...     "Number of movies": ["87", "53", "69"],
+        ... }
+        >>> table = pd.DataFrame.from_dict(data)
+        >>> queries = [
+        ...     "There is only one actor who is 45 years old",
+        ...     "There are 3 actors which played in more than 60 movies",
+        ... ]
+
+        >>> inputs = tokenizer(table=table, queries=queries, padding="max_length", return_tensors="tf")
+        >>> labels = tf.convert_to_tensor([1, 0])  # 1 means entailed, 0 means refuted
+
+        >>> outputs = model(**inputs, labels=labels)
+        >>> loss = outputs.loss
+        >>> logits = outputs.logits
+        ```"""
+
+        outputs = self.tapas(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            training=training,
+        )
+        pooled_output = outputs[1]
+        pooled_output = self.dropout(inputs=pooled_output, training=training)
+        logits = self.classifier(inputs=pooled_output)
+        loss = None if labels is None else self.hf_compute_loss(labels=labels, logits=logits)
+
+        if not return_dict:
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
+
+        return TFSequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+    def build(self, input_shape=None):
+        if self.built:
+            return
+        self.built = True
+        if getattr(self, "tapas", None) is not None:
+            with tf.name_scope(self.tapas.name):
+                self.tapas.build(None)
+        if getattr(self, "dropout", None) is not None:
+            with tf.name_scope(self.dropout.name):
+                self.dropout.build(None)
+        if getattr(self, "classifier", None) is not None:
+            with tf.name_scope(self.classifier.name):
+                self.classifier.build([None, None, self.config.hidden_size])
+
+
+""" TAPAS utilities."""
+
+
+class AverageApproximationFunction(str, enum.Enum):
+    RATIO = "ratio"
+    FIRST_ORDER = "first_order"
+    SECOND_ORDER = "second_order"
+
+
+# Beginning of everything related to segmented tensors
+
+
+class IndexMap:
+    """Index grouping entries within a tensor."""
+
+    def __init__(self, indices, num_segments, batch_dims=0):
+        """
+        Creates an index.
+
+        Args:
+          indices: <int32> Tensor of indices, same shape as `values`.
+          num_segments: <int32> Scalar tensor, the number of segments. All elements
+            in a batched segmented tensor must have the same number of segments (although many segments can be empty).
+          batch_dims: Python integer, the number of batch dimensions. The first
+            `batch_dims` dimensions of a SegmentedTensor are treated as batch dimensions. Segments in different batch
+            elements are always distinct even if they have the same index.
+        """
+        self.indices = tf.convert_to_tensor(indices)
+        self.num_segments = tf.convert_to_tensor(num_segments)
+        self.batch_dims = batch_dims
+
+    def batch_shape(self):
+        return tf.shape(self.indices)[: self.batch_dims]
+
+
+class ProductIndexMap(IndexMap):
+    """The product of two indices."""
+
+    def __init__(self, outer_index, inner_index):
+        """
+        Combines indices i and j into pairs (i, j). The result is an index where each segment (i, j) is the
+        intersection of segments i and j. For example if the inputs represent table cells indexed by respectively rows
+        and columns the output will be a table indexed by (row, column) pairs, i.e. by cell. The implementation
+        combines indices {0, .., n - 1} and {0, .., m - 1} into {0, .., nm - 1}. The output has `num_segments` equal to
+        `outer_index.num_segements` * `inner_index.num_segments`.
+
+        Args:
+          outer_index: IndexMap.
+          inner_index: IndexMap, must have the same shape as `outer_index`.
+        """
+        if outer_index.batch_dims != inner_index.batch_dims:
+            raise ValueError("outer_index.batch_dims and inner_index.batch_dims must be the same.")
+
+        super(ProductIndexMap, self).__init__(
+            indices=(
+                inner_index.indices
+                + outer_index.indices * tf.cast(inner_index.num_segments, inner_index.indices.dtype)
+            ),
+            num_segments=inner_index.num_segments * outer_index.num_segments,
+            batch_dims=inner_index.batch_dims,
+        )
+        self.outer_index = outer_index
+        self.inner_index = inner_index
+
+    def project_outer(self, index):
+        """Projects an index with the same index set onto the outer components."""
+        return IndexMap(
+            indices=tf.math.floordiv(index.indices, self.inner_index.num_segments),
+            num_segments=self.outer_index.num_segments,
+            batch_dims=index.batch_dims,
+        )
+
+    def project_inner(self, index):
+        """Projects an index with the same index set onto the inner components."""
+        return IndexMap(
+            indices=tf.math.floormod(index.indices, self.inner_index.num_segments),
+            num_segments=self.inner_index.num_segments,
+            batch_dims=index.batch_dims,
+        )
+
+
+def gather(values, index, name="segmented_gather"):
+    """
+    Gathers from `values` using the index map. For each element in the domain of the index map this operation looks up
+    a value for that index in `values`. Two elements from the same segment always get assigned the same value.
+
+    Args:
+      values: [B1, ..., Bn, num_segments, V1, ...] Tensor with segment values.
+      index: [B1, ..., Bn, I1, ..., Ik] IndexMap.
+      name: Name for the TensorFlow operation.
+
+    Returns:
+      [B1, ..., Bn, I1, ..., Ik, V1, ...] Tensor with the gathered values.
+    """
+    return tf.gather(values, index.indices, batch_dims=index.batch_dims, name=name)
+
+
+def flatten(index, name="segmented_flatten"):
+    """
+    Flattens a batched index map to a 1d index map. This operation relabels the segments to keep batch elements
+    distinct. The k-th batch element will have indices shifted by `num_segments` * (k - 1). The result is a tensor with
+    `num_segments` multiplied by the number of elements in the batch.
+
+    Args:
+      index: IndexMap to flatten.
+      name: Name for the TensorFlow operation.
+
+    Returns:
+      The flattened IndexMap.
+    """
+    batch_size = tf.reduce_prod(index.batch_shape())
+    offset = tf.range(batch_size) * index.num_segments
+    offset = tf.reshape(offset, index.batch_shape())
+    for _ in range(index.batch_dims, index.indices.shape.rank):
+        offset = tf.expand_dims(offset, -1)
+
+    indices = tf.cast(offset, index.indices.dtype) + index.indices
+    return IndexMap(indices=tf.reshape(indices, [-1]), num_segments=index.num_segments * batch_size, batch_dims=0)
+
+
+def range_index_map(batch_shape, num_segments, name="range_index_map"):
+    """
+    Constructs an index map equal to range(num_segments).
+
+    Args:
+        batch_shape (`tf.Tensor`):
+            Batch shape
+        num_segments (`int`):
+            Number of segments
+        name (`str`, *optional*, defaults to 'range_index_map'):
+            Name for the operation. Currently not used
+
+    Returns:
+        (`IndexMap`): IndexMap of shape batch_shape with elements equal to range(num_segments).
+    """
+    batch_shape = tf.convert_to_tensor(batch_shape)
+    batch_shape.shape.assert_has_rank(1)
+    num_segments = tf.convert_to_tensor(num_segments)
+    num_segments.shape.assert_has_rank(0)
+
+    indices = tf.range(num_segments)
+    shape = tf.concat([tf.ones_like(batch_shape, dtype=tf.int32), tf.expand_dims(num_segments, axis=0)], axis=0)
+    indices = tf.reshape(indices, shape)
+    multiples = tf.concat([batch_shape, [1]], axis=0)
+    indices = tf.tile(indices, multiples)
+    return IndexMap(indices=indices, num_segments=num_segments, batch_dims=batch_shape.shape.as_list()[0])
+
+
+def _segment_reduce(values, index, segment_reduce_fn, name):
+    """
+    Applies a segment reduction segment-wise.
+
+    Args:
+        values (`tf.Tensor`):
+            Tensor with segment values.
+        index (`IndexMap`):
+            IndexMap.
+        segment_reduce_fn (`str`):
+            Name for the reduce operation. One of "sum", "mean", "max" or "min".
+        name (`str`):
+            Name for the operation. Currently not used
+
+    Returns:
+        (`IndexMap`): IndexMap of shape batch_shape with elements equal to range(num_segments).
+    """
+    # Flatten the batch dimensions, as segments ops do not support batching.
+    # However if `values` has extra dimensions to the right keep them
+    # unflattened. Segmented ops support vector-valued operations.
+    flat_index = flatten(index)
+    vector_shape = tf.shape(values)[index.indices.shape.rank :]
+    flattened_shape = tf.concat([[-1], vector_shape], axis=0)
+    flat_values = tf.reshape(values, flattened_shape)
+    segment_means = segment_reduce_fn(
+        data=flat_values, segment_ids=flat_index.indices, num_segments=flat_index.num_segments
+    )
+
+    # Unflatten the values.
+    new_shape = tf.concat([index.batch_shape(), [index.num_segments], vector_shape], axis=0)
+    output_values = tf.reshape(segment_means, new_shape)
+    output_index = range_index_map(index.batch_shape(), index.num_segments)
+    return output_values, output_index
+
+
+def reduce_mean(values, index, name="segmented_reduce_mean"):
+    """
+    Averages a tensor over its segments. Outputs 0 for empty segments. This operations computes the mean over segments,
+    with support for:
+
+      - Batching using the first dimensions [B1, B2, ..., Bn]. Each element in a batch can have different indices.
+      - Vectorization using the last dimension [V1, V2, ...]. If they are present the output will be a mean of vectors
+        rather than scalars.
+    Only the middle dimensions [I1, ..., Ik] are reduced by the operation.
+
+    Args:
+      values: [B1, B2, ..., Bn, I1, .., Ik, V1, V2, ..] tensor of values to be
+        averaged.
+      index: IndexMap [B1, B2, ..., Bn, I1, .., Ik] index defining the segments.
+      name: Name for the TensorFlow ops.
+
+    Returns:
+      A pair (output_values, output_index) where `output_values` is a tensor of shape [B1, B2, ..., Bn, num_segments,
+      V1, V2, ..] and `index` is an IndexMap with shape [B1, B2, ..., Bn, num_segments].
+    """
+    return _segment_reduce(values, index, tf.math.unsorted_segment_mean, name)
+
+
+def reduce_sum(values, index, name="segmented_reduce_sum"):
+    """
+    Sums a tensor over its segments. Outputs 0 for empty segments. This operations computes the sum over segments, with
+    support for:
+
+      - Batching using the first dimensions [B1, B2, ..., Bn]. Each element in a batch can have different indices.
+      - Vectorization using the last dimension [V1, V2, ...]. If they are present the output will be a sum of vectors
+        rather than scalars.
+    Only the middle dimensions [I1, ..., Ik] are reduced by the operation.
+
+    Args:
+      values: [B1, B2, ..., Bn, I1, .., Ik, V1, V2, ..] tensor of values to be
+        averaged.
+      index: IndexMap [B1, B2, ..., Bn, I1, .., Ik] index defining the segments.
+      name: Name for the TensorFlow ops.
+
+    Returns:
+      A pair (output_values, output_index) where `output_values` is a tensor of shape [B1, B2, ..., Bn, num_segments,
+      V1, V2, ..] and `index` is an IndexMap with shape [B1, B2, ..., Bn, num_segments].
+    """
+    return _segment_reduce(values, index, tf.math.unsorted_segment_sum, name)
+
+
+def reduce_max(values, index, name="segmented_reduce_max"):
+    """
+    Computes the maximum over segments. This operations computes the maximum over segments, with support for:
+
+      - Batching using the first dimensions [B1, B2, ..., Bn]. Each element in a batch can have different indices.
+      - Vectorization using the last dimension [V1, V2, ...]. If they are present the output will be an element-wise
+        maximum of vectors rather than scalars.
+    Only the middle dimensions [I1, ..., Ik] are reduced by the operation.
+
+    Args:
+      values: [B1, B2, ..., Bn, I1, .., Ik, V1, V2, ..] tensor of values to be
+        averaged.
+      index: IndexMap [B1, B2, ..., Bn, I1, .., Ik] index defining the segments.
+      name: Name for the TensorFlow ops.
+
+    Returns:
+      A pair (output_values, output_index) where `output_values` is a tensor of shape [B1, B2, ..., Bn, num_segments,
+      V1, V2, ..] and `index` is an IndexMap with shape [B1, B2, ..., Bn, num_segments].
+    """
+    return _segment_reduce(values, index, tf.math.unsorted_segment_max, name)
+
+
+def reduce_min(values, index, name="segmented_reduce_min"):
+    """Computes the minimum over segments."""
+    return _segment_reduce(values, index, tf.math.unsorted_segment_min, name)
+
+
+def _single_column_cell_selection_loss(token_logits, column_logits, labels, cell_index, col_index, cell_mask):
+    """
+    Computes the loss for cell selection constrained to a single column. The loss is a hierarchical log-likelihood. The
+    model first predicts a column and then selects cells within that column (conditioned on the column). Cells outside
+    the selected column are never selected.
+
+    Args:
+        token_logits (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Tensor containing the logits per token.
+        column_logits (`tf.Tensor` of shape `(batch_size, max_num_cols)`):
+            Tensor containing the logits per column.
+        labels (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Labels per token.
+        cell_index (`ProductIndexMap`):
+            Index that groups tokens into cells.
+        col_index (`IndexMap`):
+            Index that groups tokens into columns.
+        cell_mask (`tf.Tensor` of shape `(batch_size, max_num_rows * max_num_cols)`):
+            Mask for cells that exist in the table (i.e. that are not padding).
+
+    Returns:
+        selection_loss_per_example (`tf.Tensor` of shape `(batch_size,)`): Loss for each example. logits (`tf.Tensor`
+        of shape `(batch_size, sequence_length)`): New logits which are only allowed to select cells in a single
+        column. Logits outside of the most likely column according to *column_logits* will be set to a very low value
+        (such that the probabilities are 0).
+    """
+    # First find the column we should select. We use the column with maximum
+    # number of selected cells.
+    labels_per_column, _ = reduce_sum(tf.cast(labels, tf.float32), col_index)
+    column_label = tf.argmax(labels_per_column, axis=-1, output_type=tf.int32)
+    # Check if there are no selected cells in the column. In that case the model
+    # should predict the special column id 0, which means "select nothing".
+    no_cell_selected = tf.equal(tf.reduce_max(labels_per_column, axis=-1), 0)
+    column_label = tf.where(no_cell_selected, tf.zeros_like(column_label), column_label)
+
+    column_dist = tfp.distributions.Categorical(logits=column_logits)
+    column_loss_per_example = -column_dist.log_prob(column_label)
+
+    # Reduce the labels and logits to per-cell from per-token.
+    logits_per_cell, _ = reduce_mean(token_logits, cell_index)
+    labels_per_cell, labels_index = reduce_max(tf.cast(labels, tf.int32), cell_index)
+
+    # Mask for the selected column.
+    column_id_for_cells = cell_index.project_inner(labels_index).indices
+    column_mask = tf.cast(tf.equal(column_id_for_cells, tf.expand_dims(column_label, axis=1)), tf.float32)
+
+    # Compute the log-likelihood for cells, but only for the selected column.
+    cell_dist = tfp.distributions.Bernoulli(logits=logits_per_cell)
+    cell_log_prob = cell_dist.log_prob(labels_per_cell)
+    cell_loss = -tf.reduce_sum(cell_log_prob * column_mask * cell_mask, axis=1)
+    # We need to normalize the loss by the number of cells in the column.
+    cell_loss /= tf.reduce_sum(column_mask * cell_mask, axis=1) + EPSILON_ZERO_DIVISION
+
+    selection_loss_per_example = column_loss_per_example
+    selection_loss_per_example += tf.where(no_cell_selected, tf.zeros_like(selection_loss_per_example), cell_loss)
+
+    # Set the probs outside the selected column (selected by the *model*)
+    # to 0. This ensures backwards compatibility with models that select
+    # cells from multiple columns.
+    selected_column_id = tf.argmax(column_logits, axis=-1, output_type=tf.int32)
+    selected_column_mask = tf.cast(
+        tf.equal(column_id_for_cells, tf.expand_dims(selected_column_id, axis=-1)), tf.float32
+    )
+    # Never select cells with the special column id 0.
+    selected_column_mask = tf.where(
+        tf.equal(column_id_for_cells, 0), tf.zeros_like(selected_column_mask), selected_column_mask
+    )
+    logits_per_cell += CLOSE_ENOUGH_TO_LOG_ZERO * (1.0 - cell_mask * selected_column_mask)
+    logits = gather(logits_per_cell, cell_index)
+
+    return selection_loss_per_example, logits
+
+
+def _calculate_aggregate_mask(answer, pooled_output, cell_selection_preference, labels, aggregation_classifier):
+    """
+    Finds examples where the model should select cells with no aggregation.
+
+    Returns a mask that determines for which examples should the model select answers directly from the table, without
+    any aggregation function. If the answer is a piece of text the case is unambiguous as aggregation functions only
+    apply to numbers. If the answer is a number but does not appear in the table then we must use some aggregation
+    case. The ambiguous case is when the answer is a number that also appears in the table. In this case we use the
+    aggregation function probabilities predicted by the model to decide whether to select or aggregate. The threshold
+    for this is a hyperparameter *cell_selection_preference*
+
+    Args:
+        answer (`tf.Tensor` of shape `(batch_size, )`):
+            Answer for every example in the batch. Nan if there is no scalar answer.
+        pooled_output (`tf.Tensor` of shape `(batch_size, hidden_size)`):
+            Output of the pooler (BertPooler) on top of the encoder layer.
+        cell_selection_preference (`float`):
+            Preference for cell selection in ambiguous cases.
+        labels (`tf.Tensor` of shape `(batch_size, sequence_length)`):
+            Labels per token. aggregation_classifier (`torch.nn.Linear`): Aggregation head
+
+    Returns:
+        aggregate_mask (`tf.Tensor` of shape `(batch_size,)`): A mask set to 1 for examples that should use aggregation
+        functions.
+    """
+    # tf.Tensor(batch_size,)
+    aggregate_mask_init = tf.cast(tf.logical_not(tf.math.is_nan(answer)), tf.float32)
+    logits_aggregation = aggregation_classifier(pooled_output)
+    dist_aggregation = tfp.distributions.Categorical(logits=logits_aggregation)
+    # Index 0 corresponds to "no aggregation".
+    aggregation_ops_total_mass = tf.reduce_sum(dist_aggregation.probs_parameter()[:, 1:], axis=1)
+    # Cell selection examples according to current model.
+    is_pred_cell_selection = aggregation_ops_total_mass <= cell_selection_preference
+    # Examples with non-empty cell selection supervision.
+    is_cell_supervision_available = tf.reduce_sum(labels, axis=1) > 0
+    aggregate_mask = tf.where(
+        tf.logical_and(is_pred_cell_selection, is_cell_supervision_available),
+        tf.zeros_like(aggregate_mask_init, dtype=tf.float32),
+        aggregate_mask_init,
+    )
+    aggregate_mask = tf.stop_gradient(aggregate_mask)
+    return aggregate_mask
+
+
+def _calculate_aggregation_loss_known(
+    logits_aggregation, aggregate_mask, aggregation_labels, use_answer_as_supervision, num_aggregation_labels
+):
+    """
+    Calculates aggregation loss when its type is known during training.
+
+    In the weakly supervised setting, the only known information is that for cell selection examples, "no aggregation"
+    should be predicted. For other examples (those that require aggregation), no loss is accumulated. In the setting
+    where aggregation type is always known, standard cross entropy loss is accumulated for all examples
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions.
+        aggregation_labels (`tf.Tensor` of shape `(batch_size, )`):
+            Aggregation function id for every example in the batch.
+        use_answer_as_supervision (`bool`, *optional*):
+            Whether to use the answer as the only supervision for aggregation examples.
+        num_aggregation_labels (`int`, *optional*, defaults to 0):
+            The number of aggregation operators to predict.
+
+    Returns:
+        aggregation_loss_known (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss (when its type is known during
+        training) per example.
+    """
+    if use_answer_as_supervision:
+        # Prepare "no aggregation" targets for cell selection examples.
+        target_aggregation = tf.zeros_like(aggregate_mask, dtype=tf.int32)
+    else:
+        # Use aggregation supervision as the target.
+        target_aggregation = aggregation_labels
+
+    one_hot_labels = tf.one_hot(target_aggregation, depth=num_aggregation_labels, dtype=tf.float32)
+    log_probs = tf.nn.log_softmax(logits_aggregation, axis=-1)
+
+    # <float32>[batch_size]
+    per_example_aggregation_intermediate = -tf.reduce_sum(one_hot_labels * log_probs, axis=-1)
+    if use_answer_as_supervision:
+        # Accumulate loss only for examples requiring cell selection
+        # (no aggregation).
+        return per_example_aggregation_intermediate * (1 - aggregate_mask)
+    else:
+        return per_example_aggregation_intermediate
+
+
+def _calculate_aggregation_loss_unknown(logits_aggregation, aggregate_mask):
+    """
+    Calculates aggregation loss in the case of answer supervision.
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions
+
+    Returns:
+        aggregation_loss_unknown (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss (in case of answer
+        supervision) per example.
+    """
+    dist_aggregation = tfp.distributions.Categorical(logits=logits_aggregation)
+    # Index 0 corresponds to "no aggregation".
+    aggregation_ops_total_mass = tf.reduce_sum(dist_aggregation.probs_parameter()[:, 1:], axis=1)
+    # Predict some aggregation in case of an answer that needs aggregation.
+    # This increases the probability of all aggregation functions, in a way
+    # similar to MML, but without considering whether the function gives the
+    # correct answer.
+    return -tf.math.log(aggregation_ops_total_mass) * aggregate_mask
+
+
+def _calculate_aggregation_loss(
+    logits_aggregation,
+    aggregate_mask,
+    aggregation_labels,
+    use_answer_as_supervision,
+    num_aggregation_labels,
+    aggregation_loss_weight,
+):
+    """
+    Calculates the aggregation loss per example.
+
+    Args:
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        aggregate_mask (`tf.Tensor` of shape `(batch_size, )`):
+            A mask set to 1 for examples that should use aggregation functions.
+        aggregation_labels (`tf.Tensor` of shape `(batch_size, )`):
+            Aggregation function id for every example in the batch.
+        use_answer_as_supervision (`bool`, *optional*):
+            Whether to use the answer as the only supervision for aggregation examples.
+        num_aggregation_labels (`int`, *optional*, defaults to 0):
+            The number of aggregation operators to predict.
+        aggregation_loss_weight (`float`, *optional*, defaults to 1.0):
+            Importance weight for the aggregation loss.
+
+    Returns:
+        aggregation_loss (`tf.Tensor` of shape `(batch_size,)`): Aggregation loss per example.
+    """
+    per_example_aggregation_loss = _calculate_aggregation_loss_known(
+        logits_aggregation, aggregate_mask, aggregation_labels, use_answer_as_supervision, num_aggregation_labels
+    )
+
+    if use_answer_as_supervision:
+        # Add aggregation loss for numeric answers that need aggregation.
+        per_example_aggregation_loss += _calculate_aggregation_loss_unknown(logits_aggregation, aggregate_mask)
+    return aggregation_loss_weight * per_example_aggregation_loss
+
+
+def _calculate_expected_result(
+    dist_per_cell, numeric_values, numeric_values_scale, input_mask_float, logits_aggregation, config
+):
+    """
+    Calculates the expected result given cell and aggregation probabilities.
+
+    Args:
+        dist_per_cell (`tfp.distributions.Bernoulli`):
+            Cell selection distribution for each cell.
+        numeric_values (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Numeric values of every token. Nan for tokens which are not numeric values.
+        numeric_values_scale (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Scale of the numeric values of every token.
+        input_mask_float (`tf.Tensor` of shape `(batch_size, seq_length)`):
+            Mask for the table, without question tokens and table headers.
+        logits_aggregation (`tf.Tensor` of shape `(batch_size, num_aggregation_labels)`):
+            Logits per aggregation operation.
+        config ([`TapasConfig`]):
+    

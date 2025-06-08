@@ -1,0 +1,24 @@
+# Model Configuration
+models:
+  text_embedding: "sentence-transformers/all-MiniLM-L6-v2"
+  image_embedding: "clip-ViT-B-32"
+  llm_model: "gpt-4.1-nano"
+
+# Database Configuration
+database:
+  vector_store: "chroma"
+  collection_name: "batch_articles"
+  persist_directory: "./data/chroma_db"
+
+# Scraping Configuration
+scraping:
+  base_url: "https://www.deeplearning.ai/the-batch/"
+  max_articles: 1000
+  delay_seconds: 0.2
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# UI Configuration
+ui:
+  page_title: "The Batch Multimodal RAG"
+  max_results: 5
+  similarity_threshold: 0.7
