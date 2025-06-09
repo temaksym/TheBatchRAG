@@ -2,6 +2,8 @@
 
 A Retrieval-Augmented Generation (RAG) system for "The Batch" newsletter by DeepLearning.AI. This project scrapes articles and images, builds a multimodal vector database, and provides a Streamlit-powered UI for semantic search and LLM-based question answering.
 
+Demo of working prototype is here: https://youtu.be/xLqsQQZvZhY
+
 ---
 
 ## Features
